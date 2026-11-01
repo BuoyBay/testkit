@@ -1,0 +1,12 @@
+Import testkit
+
+Private Sub Arithmetic()
+    Check.IntEqual(6 * 7, 42)
+    Check.DoubleWithin(0.1 + 0.2, 0.3, 0.000001)
+End Sub
+
+Sub Main()
+    Dim suite As New TestSuite("example")
+    suite.Run("arithmetic", AddressOf Arithmetic)
+    suite.Finish()
+End Sub

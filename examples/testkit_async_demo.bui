@@ -1,0 +1,38 @@
+Import testkit
+
+Private Class PendingExample
+    Public Shared Property Token As AsyncTestToken
+    Public Shared Property Cleaned As Boolean = False
+End Class
+
+Private Sub CompleteWork()
+    ' Catch assertions/errors inside a dispatched callback with Token.Invoke.
+    PendingExample.Token.Complete()
+End Sub
+
+Private Sub StartWork(token As AsyncTestToken)
+    PendingExample.Token = token
+    MainThread.InvokeAsync(AddressOf CompleteWork)
+End Sub
+
+Private Sub CleanWork()
+    PendingExample.Cleaned = True
+End Sub
+
+Private Sub VerifyCleanup()
+    Check.IsTrue(PendingExample.Cleaned, "async cleanup completed")
+End Sub
+
+Sub Main()
+    Dim suite As New TestSuite("async example")
+    Dim token As AsyncTestToken = suite.RunAsync("queued work", AddressOf StartWork, 1.0, cleanup: AddressOf CleanWork)
+    While suite.HasPendingAsync
+        ' This is a console program. The caller owns its queue scheduling.
+        ' A desktop app instead calls PollAsync from its existing native timer.
+        RunLoop.PumpOnce()
+        suite.PollAsync()
+        Sleep(1)
+    End While
+    suite.Run("cleanup", AddressOf VerifyCleanup)
+    suite.Finish()
+End Sub

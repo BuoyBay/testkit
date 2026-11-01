@@ -1,0 +1,734 @@
+#If TargetWindows Then
+Private Declare Sub TestKitExit Lib "msvcrt" Alias "exit" (status As Int32)
+#Else
+Private Declare Sub TestKitExit Lib "c" Alias "exit" (status As Int32)
+#End If
+
+''' A named test or fixture callback. Register explicitly with AddressOf.
+Public Delegate Sub TestAction()
+
+''' Match an exception using typed IsA checks or application-specific fields.
+Public Delegate Function ExceptionMatcher(error As Exception) As Boolean
+
+''' Starts an asynchronous case; complete the token from the main thread.
+Public Delegate Sub AsyncTestAction(token As AsyncTestToken)
+
+Private Function TestFailureMessage(message As String) As String
+    Dim bounded As String = String.Left(message, 1020)
+    While String.LenBytes(bounded) > 1020
+        bounded = String.Left(bounded, String.Len(bounded) - 1)
+    End While
+    If String.Len(bounded) < String.Len(message) Then bounded += "..."
+    Return bounded
+End Function
+
+''' Catchable assertion failure, separate from the exit-on-failure Testing prelude.
+Public Class TestFailure Inherits Exception
+    Public Sub Constructor(message As String)
+        Super.Constructor(TestFailureMessage(message))
+    End Sub
+End Class
+
+''' Throw from a case to record a skipped test. Cleanup still runs.
+Public Class TestSkipped Inherits Exception
+    Public Sub Constructor(message As String)
+        Super.Constructor(message)
+    End Sub
+End Class
+
+''' Assertions throw TestFailure; they never call the built-in Assert class.
+Public Class Check
+    Public Shared Sub IsTrue(passed As Boolean, label As String = "condition")
+        If Not passed Then Throw New TestFailure(Check.Bounded(label) + ": expected True")
+    End Sub
+
+    Public Shared Sub IntEqual(actual As Integer, expected As Integer, label As String = "integer")
+        If actual <> expected Then Throw New TestFailure(Check.Bounded(label) + ": expected " + Str(expected) + ", got " + Str(actual))
+    End Sub
+
+    Private Shared Function Bounded(value As String, limit As Integer = 160) As String
+        If String.Len(value) <= limit Then Return value
+        Return String.Left(value, limit) + "..."
+    End Function
+
+    Public Shared Sub Fail(message As String = "explicit failure")
+        Throw New TestFailure(Check.Bounded(message, 900))
+    End Sub
+
+    Public Shared Sub StringEqual(actual As String, expected As String, label As String = "string")
+        If String.Compare(actual, expected, True) = 0 Then Return
+        Dim offset As Integer = 0
+        Dim common As Integer = Math.Min(String.Len(actual), String.Len(expected))
+        Dim line As Integer = 1
+        Dim column As Integer = 1
+        While offset < common
+            Dim ch As String = String.Substring(expected, offset, 1)
+            If String.Compare(String.Substring(actual, offset, 1), ch, True) <> 0 Then Exit While
+            If ch = "\n" Then
+                line += 1
+                column = 1
+            Else
+                column += 1
+            End If
+            offset += 1
+        End While
+        Dim start As Integer = Math.Max(0, offset - 24)
+        Dim want As String = String.Substring(expected, start, Math.Min(60, String.Len(expected) - start))
+        Dim got As String = String.Substring(actual, start, Math.Min(60, String.Len(actual) - start))
+        Throw New TestFailure(Check.Bounded(label) + ": difference at index " + Str(offset) + ", line " + Str(line) + ", column " + Str(column) + "; expected " + Json.Stringify(JSONItem.From(want)) + ", got " + Json.Stringify(JSONItem.From(got)) + "; lengths " + Str(String.Len(expected)) + "/" + Str(String.Len(actual)))
+    End Sub
+
+    Public Shared Sub ArrayEqual(actual As Array Of Integer, expected As Array Of Integer, label As String = "array")
+        Dim common As Integer = Math.Min(Array.Count(actual), Array.Count(expected))
+        For i As Integer = 0 To common - 1
+            If actual(i) <> expected(i) Then Throw New TestFailure(Check.Bounded(label) + ": difference at index " + Str(i) + "; expected " + Str(expected(i)) + ", got " + Str(actual(i)) + "; lengths " + Str(Array.Count(expected)) + "/" + Str(Array.Count(actual)))
+        Next
+        If Array.Count(actual) <> Array.Count(expected) Then Throw New TestFailure(Check.Bounded(label) + ": length difference at index " + Str(common) + "; lengths " + Str(Array.Count(expected)) + "/" + Str(Array.Count(actual)))
+    End Sub
+
+    Public Shared Sub ArrayEqual(actual As Array Of String, expected As Array Of String, label As String = "array")
+        Dim common As Integer = Math.Min(Array.Count(actual), Array.Count(expected))
+        For i As Integer = 0 To common - 1
+            If String.Compare(actual(i), expected(i), True) <> 0 Then
+                Throw New TestFailure(Check.Bounded(label) + ": difference at index " + Str(i) + "; expected " + Json.Stringify(JSONItem.From(Check.Bounded(expected(i), 60))) + ", got " + Json.Stringify(JSONItem.From(Check.Bounded(actual(i), 60))) + "; lengths " + Str(Array.Count(expected)) + "/" + Str(Array.Count(actual)))
+            End If
+        Next
+        If Array.Count(actual) <> Array.Count(expected) Then Throw New TestFailure(Check.Bounded(label) + ": length difference at index " + Str(common) + "; lengths " + Str(Array.Count(expected)) + "/" + Str(Array.Count(actual)))
+    End Sub
+
+    Public Shared Sub ArrayEqual(actual As Array Of Double, expected As Array Of Double, tolerance As Double, label As String = "array")
+        If Not (tolerance >= 0.0) Or Not (tolerance - tolerance = 0.0) Then Throw New InvalidArgumentException("tolerance must be finite and nonnegative")
+        Dim common As Integer = Math.Min(Array.Count(actual), Array.Count(expected))
+        For i As Integer = 0 To common - 1
+            Dim difference As Double = actual(i) - expected(i)
+            If Not (difference >= -tolerance And difference <= tolerance) Then Throw New TestFailure(Check.Bounded(label) + ": difference at index " + Str(i) + "; tolerance " + Str(tolerance) + "; lengths " + Str(Array.Count(expected)) + "/" + Str(Array.Count(actual)))
+        Next
+        If Array.Count(actual) <> Array.Count(expected) Then Throw New TestFailure(Check.Bounded(label) + ": length difference at index " + Str(common) + "; lengths " + Str(Array.Count(expected)) + "/" + Str(Array.Count(actual)))
+    End Sub
+
+    Public Shared Sub BytesEqual(actual As Bytes, expected As Bytes, label As String = "bytes")
+        If actual = Nil Or expected = Nil Then Throw New InvalidArgumentException("byte buffers are required")
+        Dim common As Integer = Math.Min(actual.Count, expected.Count)
+        For i As Integer = 0 To common - 1
+            If actual.Item(i) <> expected.Item(i) Then Throw New TestFailure(Check.Bounded(label) + ": difference at offset " + Str(i) + "; expected " + Str(expected.Item(i)) + ", got " + Str(actual.Item(i)) + "; lengths " + Str(expected.Count) + "/" + Str(actual.Count))
+        Next
+        If actual.Count <> expected.Count Then Throw New TestFailure(Check.Bounded(label) + ": length difference at offset " + Str(common) + "; lengths " + Str(expected.Count) + "/" + Str(actual.Count))
+    End Sub
+
+    Public Shared Sub DoubleWithin(actual As Double, expected As Double, tolerance As Double, label As String = "double")
+        ' The positive comparison also rejects NaN and infinity-derived NaN.
+        If Not (tolerance >= 0.0) Or Not (tolerance - tolerance = 0.0) Then
+            Throw New InvalidArgumentException("tolerance must be finite and nonnegative")
+        End If
+        Dim difference As Double = actual - expected
+        If Not (difference >= -tolerance And difference <= tolerance) Then
+            Throw New TestFailure(Check.Bounded(label) + ": difference exceeds tolerance " + Str(tolerance))
+        End If
+    End Sub
+
+    Public Shared Sub Throws(action As TestAction, label As String = "exception")
+        If action = Nil Then Throw New InvalidArgumentException("action is required")
+        Dim thrown As Boolean = False
+        Try
+            action()
+        Catch e As Exception
+            thrown = True
+        End Try
+        If Not thrown Then Throw New TestFailure(Check.Bounded(label) + ": expected an exception")
+    End Sub
+
+    ''' Require an exact concrete runtime type name and return the captured exception.
+    Public Shared Function ThrowsType(action As TestAction, expectedType As String, label As String = "exception") As Exception
+        If action = Nil Or String.Trim(expectedType) = "" Then Throw New InvalidArgumentException("action and expected type are required")
+        Dim captured As Exception = Nil
+        Try
+            action()
+        Catch error As Exception
+            captured = error
+        End Try
+        If captured = Nil Then Throw New TestFailure(label + ": expected " + expectedType + ", no exception thrown")
+        If String.Compare(captured.TypeName(), expectedType, True) <> 0 Then Throw New TestFailure(label + ": expected " + expectedType + ", got " + captured.TypeName() + ": " + captured.Message)
+        Return captured
+    End Function
+
+    ''' Require a caller's typed predicate; subclasses can match through IsA.
+    Public Shared Function ThrowsMatching(action As TestAction, matcher As ExceptionMatcher, label As String = "exception") As Exception
+        If action = Nil Or matcher = Nil Then Throw New InvalidArgumentException("action and exception matcher are required")
+        Dim captured As Exception = Nil
+        Try
+            action()
+        Catch error As Exception
+            captured = error
+        End Try
+        If captured = Nil Then Throw New TestFailure(label + ": expected a matching exception, no exception thrown")
+        If Not matcher(captured) Then Throw New TestFailure(label + ": unexpected " + captured.TypeName() + ": " + captured.Message)
+        Return captured
+    End Function
+End Class
+
+''' Match case-sensitive patterns; only * and ? are special.
+Public Function TestPatternMatches(value As String, pattern As String) As Boolean
+    Dim v As Integer = 0
+    Dim p As Integer = 0
+    Dim star As Integer = -1
+    Dim retry As Integer = 0
+    While v < String.Len(value)
+        Dim ch As String = String.Substring(pattern, p, 1)
+        If p < String.Len(pattern) And ch <> "*" And (ch = "?" Or String.Compare(ch, String.Substring(value, v, 1), True) = 0) Then
+            v += 1
+            p += 1
+        ElseIf p < String.Len(pattern) And ch = "*" Then
+            star = p
+            p += 1
+            retry = v
+        ElseIf star >= 0 Then
+            retry += 1
+            v = retry
+            p = star + 1
+        Else
+            Return False
+        End If
+    End While
+    While p < String.Len(pattern) And String.Substring(pattern, p, 1) = "*"
+        p += 1
+    End While
+    Return p = String.Len(pattern)
+End Function
+
+Private Function TestHas(values As JSONItem, value As String) As Boolean
+    For i As Integer = 0 To values.Count() - 1
+        If String.Compare(values.ValueAt(i).AsString().Or(""), value, True) = 0 Then Return True
+    Next
+    Return False
+End Function
+
+' Restricted, strict parser for the flat selection envelope. Decoded duplicate
+' keys and NUL/surrogate escapes are rejected before the stdlib can truncate them.
+Private Class TestSelectionReader
+    Private Property Source As String
+    Private Property Offset As Integer = 0
+
+    Public Sub Constructor(source As String)
+        Me.Source = source
+    End Sub
+
+    Private Sub Space()
+        While Offset < String.Len(Source)
+            If Not String.Contains(" \t\r\n", String.Substring(Source, Offset, 1), True) Then Exit While
+            Offset += 1
+        End While
+    End Sub
+
+    Private Sub Need(passed As Boolean, message As String)
+        If Not passed Then Throw New InvalidArgumentException("invalid TestKit selection: " + message)
+    End Sub
+
+    Private Sub Expect(ch As String)
+        Me.Space()
+        Me.Need(Offset < String.Len(Source) And String.Substring(Source, Offset, 1) = ch, "expected " + ch)
+        Offset += 1
+    End Sub
+
+    Private Function ReadString() As String
+        Me.Space()
+        Dim start As Integer = Offset
+        Me.Expect("\"")
+        While Offset < String.Len(Source)
+            Dim ch As String = String.Substring(Source, Offset, 1)
+            Offset += 1
+            If ch = "\"" Then
+                Return Json.Parse(String.Substring(Source, start, Offset - start)).AsString().Value
+            End If
+            Me.Need(String.Asc(ch) >= 32, "control character")
+            If ch = "\\" Then
+                Me.Need(Offset < String.Len(Source), "incomplete escape")
+                Dim escape As String = String.Substring(Source, Offset, 1)
+                Offset += 1
+                If escape = "u" Then
+                    Me.Need(Offset + 4 <= String.Len(Source), "incomplete unicode escape")
+                    Dim hex As String = String.LCase(String.Substring(Source, Offset, 4))
+                    For n As Integer = 0 To 3
+                        Me.Need(String.Contains("0123456789abcdef", String.Substring(hex, n, 1), True), "invalid unicode escape")
+                    Next
+                    Me.Need(hex <> "0000", "NUL escape")
+                    Offset += 4
+                    If String.Left(hex, 1) = "d" Then
+                        Dim second As String = String.Substring(hex, 1, 1)
+                        Me.Need(Not String.Contains("cdef", second, True), "unpaired low surrogate")
+                        If String.Contains("89ab", second, True) Then
+                            Me.Need(String.Substring(Source, Offset, 2) = "\\u", "unpaired high surrogate")
+                            Offset += 2
+                            Me.Need(Offset + 4 <= String.Len(Source), "incomplete surrogate pair")
+                            Dim low As String = String.LCase(String.Substring(Source, Offset, 4))
+                            Me.Need(String.Left(low, 1) = "d" And String.Contains("cdef", String.Substring(low, 1, 1), True), "invalid low surrogate")
+                            For n As Integer = 2 To 3
+                                Me.Need(String.Contains("0123456789abcdef", String.Substring(low, n, 1), True), "invalid low surrogate")
+                            Next
+                            Offset += 4
+                        End If
+                    End If
+                Else
+                    Me.Need(String.Contains("\"\\/bfnrt", escape, True), "invalid escape")
+                End If
+            End If
+        End While
+        Throw New InvalidArgumentException("invalid TestKit selection: unclosed string")
+    End Function
+
+    Private Function ReadArray() As JSONItem
+        Dim items As JSONItem = JSONItem.NewArray()
+        Me.Expect("[")
+        Me.Space()
+        If String.Substring(Source, Offset, 1) = "]" Then
+            Offset += 1
+            Return items
+        End If
+        Do
+            Dim item As String = Me.ReadString()
+            items.Add(item)
+            Me.Space()
+            If String.Substring(Source, Offset, 1) = "]" Then
+                Offset += 1
+                Return items
+            End If
+            Me.Expect(",")
+        Loop
+    End Function
+
+    Public Function Parse() As JSONItem
+        Dim value As JSONItem = JSONItem.NewObject()
+        Me.Expect("{")
+        Do
+            Dim key As String = Me.ReadString()
+            Me.Need(Not value.HasKey(key), "duplicate key " + key)
+            Me.Expect(":")
+            Me.Space()
+            Select Case key
+            Case "suite"
+                Dim suite As String = Me.ReadString()
+                Me.Need(suite <> "", "suite is required")
+                value.Value(key) = suite
+            Case "include", "exclude"
+                value.Value(key) = Me.ReadArray()
+            Case "exact"
+                If String.Compare(String.Substring(Source, Offset, 4), "null", True) = 0 Then
+                    Offset += 4
+                    value.Value(key) = JSONItem.Null()
+                Else
+                    value.Value(key) = Me.ReadArray()
+                End If
+            Case "version"
+                Dim start As Integer = Offset
+                While Offset < String.Len(Source)
+                    Dim ch As String = String.Substring(Source, Offset, 1)
+                    If String.Contains(",} \t\r\n", ch, True) Then Exit While
+                    Offset += 1
+                End While
+                Dim version As JSONItem = Json.Parse(String.Substring(Source, start, Offset - start))
+                Me.Need(version.IsNumber() And version.AsNumber().Or(0.0) = 1.0, "unsupported version")
+                value.Value(key) = version
+            Case Else
+                Throw New InvalidArgumentException("invalid TestKit selection: unknown key " + key)
+            End Select
+            Me.Space()
+            If String.Substring(Source, Offset, 1) = "}" Then
+                Offset += 1
+                Exit Do
+            End If
+            Me.Expect(",")
+        Loop
+        Me.Space()
+        Me.Need(Offset = String.Len(Source), "trailing content")
+        Me.Need(value.Count() = 5, "version, suite, include, exclude and exact are required")
+        Return value
+    End Function
+End Class
+
+''' A single asynchronous case completion token. All operations are main-thread only.
+''' TestSuite.PollAsync performs deadlines and cleanup; it never pumps an event loop.
+Public Class AsyncTestToken
+    Private Property mOwner As Weak TestSuite
+    Private Property mDeadline As Integer
+    Private Property mStatus As String = "pending"
+    Private Property mError As Exception
+    Private Property mValid As Boolean = True
+    Private Property mInvokeDepth As Integer = 0
+
+    Public Property IsInvoking As Boolean
+        Get
+            Return mInvokeDepth > 0
+        End Get
+    End Property
+
+    Public Sub Constructor(owner As TestSuite, deadline As Integer, selected As Boolean = True)
+        If Not Thread.IsMain() Then Throw New InvalidArgumentException("async tokens must be created on the main thread")
+        If owner = Nil Then Throw New InvalidArgumentException("async token owner is required")
+        mOwner = owner
+        mDeadline = deadline
+        If Not selected Then
+            mStatus = "skipped"
+            mValid = False
+        End If
+    End Sub
+
+    Public Property IsComplete As Boolean
+        Get
+            Return mStatus <> "pending"
+        End Get
+    End Property
+
+    Public Property Status As String
+        Get
+            Return mStatus
+        End Get
+    End Property
+
+    Public Property Error As Exception
+        Get
+            Return mError
+        End Get
+    End Property
+
+    Private Function Accept() As Boolean
+        If Not Thread.IsMain() Then Throw New InvalidArgumentException("async completion must run on the main thread")
+        If Not mValid Or mStatus <> "pending" Then
+            Dim owner As TestSuite = mOwner
+            If owner <> Nil Then owner.RecordLateCallback()
+            Return False
+        End If
+        If System.Microseconds() >= mDeadline Then
+            mStatus = "failed"
+            mError = New TestFailure("asynchronous case deadline exceeded")
+            Return False
+        End If
+        Return True
+    End Function
+
+    Public Sub Complete()
+        If Me.Accept() Then mStatus = "passed"
+    End Sub
+
+    Public Sub Fail(message As String)
+        If Me.Accept() Then
+            mStatus = "failed"
+            mError = New TestFailure(String.Left(message, 900))
+        End If
+    End Sub
+
+    Public Sub Skip(message As String)
+        If Me.Accept() Then
+            mStatus = "skipped"
+            mError = New TestSkipped(String.Left(message, 900))
+        End If
+    End Sub
+
+    ''' Invoke an event callback with exception capture while this token is pending.
+    ''' The callback calls Complete explicitly; successful invocation alone does not finish.
+    Public Sub Invoke(action As TestAction)
+        If Not Me.Accept() Then Return
+        If action = Nil Then Throw New InvalidArgumentException("async callback is required")
+        mInvokeDepth += 1
+        Try
+            action()
+        Catch e As TestSkipped
+            Me.Reject(e, "skipped")
+        Catch e As TestFailure
+            Me.Reject(e, "failed")
+        Catch e As Exception
+            Me.Reject(e, "error")
+        Finally
+            mInvokeDepth -= 1
+        End Try
+    End Sub
+
+    ''' Used by the suite to retain an actual callback/setup exception.
+    Public Sub Reject(error As Exception, status As String)
+        If error = Nil Or (status <> "failed" And status <> "skipped" And status <> "error") Then Throw New InvalidArgumentException("invalid asynchronous exception result")
+        If Not Thread.IsMain() Then Throw New InvalidArgumentException("async completion must run on the main thread")
+        If Not mValid Or mStatus = "failed" Or mStatus = "error" Then
+            Dim owner As TestSuite = mOwner
+            If owner <> Nil Then owner.RecordLateCallback()
+            Return
+        End If
+        If System.Microseconds() >= mDeadline Then
+            mStatus = "failed"
+            mError = New TestFailure("asynchronous case deadline exceeded")
+            Return
+        End If
+        ' An exception from the active callback overrides optimistic completion.
+        ' PollAsync cannot seal the case until that callback/action returns.
+        mStatus = status
+        mError = error
+    End Sub
+
+    ''' Checks the monotonic deadline without dispatching platform events.
+    Public Sub Poll()
+        If Not Thread.IsMain() Then Throw New InvalidArgumentException("async polling must run on the main thread")
+        If mValid And mStatus = "pending" And System.Microseconds() >= mDeadline Then
+            mStatus = "failed"
+            mError = New TestFailure("asynchronous case deadline exceeded")
+        End If
+    End Sub
+
+    ''' Close after recording; late completion cannot affect a later case.
+    Public Sub Invalidate()
+        If Not Thread.IsMain() Then Throw New InvalidArgumentException("async token invalidation must run on the main thread")
+        If mStatus = "pending" Then Throw New InvalidArgumentException("cannot invalidate a pending async token")
+        mValid = False
+    End Sub
+End Class
+
+''' Sequential cases and explicitly polled asynchronous cases with final JSON results.
+''' Process isolation and hard deadlines belong to the external runner.
+Public Class TestSuite
+    Private Property mName As String
+    Private Property mFilter As String
+    Private Property mCases As JSONItem = JSONItem.NewArray()
+    Private Property mSelection As JSONItem
+    Private Property mSelected As Integer = 0
+    Private Property mFailures As Integer = 0
+    Private Property mFinished As Boolean = False
+    Private Property mRunning As Boolean = False
+    Private Property mLateCallbacks As Integer = 0
+    Private Property mPending As AsyncTestToken
+    Private Property mPendingItem As JSONItem
+    Private Property mPendingCleanup As TestAction
+    Private Property mPendingStart As Integer
+    Private Property mFinalizing As Boolean = False
+
+    Public Sub Constructor(name As String, filter As String = "")
+        If name = "" Then Throw New InvalidArgumentException("suite name is required")
+        mName = name
+        mFilter = filter
+        Dim filename As String = System.EnvironmentVariable("BUOY_TESTKIT_SELECTION").Or("")
+        If filename <> "" Then
+            Dim file As New FileSystemItem(filename)
+            If Not file.IsFile() Or file.Length() > 1048576 Then Throw New InvalidArgumentException("TestKit selection file is missing or too large")
+            Dim loaded As Result Of String, String = file.ReadAllText()
+            If loaded.IsErr Then Throw New InvalidArgumentException("cannot read TestKit selection file")
+            If String.LenBytes(loaded.Value) <> file.Length() Then Throw New InvalidArgumentException("invalid TestKit selection bytes")
+            Dim reader As New TestSelectionReader(loaded.Value)
+            Dim selection As JSONItem = reader.Parse()
+            If String.Compare(selection.Value("suite").AsString().Value, name, True) = 0 Then mSelection = selection
+        End If
+    End Sub
+
+    Public Property FailureCount As Integer
+        Get
+            Return mFailures
+        End Get
+    End Property
+
+    Public Property HasPendingAsync As Boolean
+        Get
+            Return mPending <> Nil
+        End Get
+    End Property
+
+    ''' Diagnostic counter only; completed/finished suites cannot be modified by tokens.
+    Public Sub RecordLateCallback()
+        If Not mFinished Then mLateCallbacks += 1
+    End Sub
+
+    Private Sub RecordDiagnostic(item As JSONItem, phase As String, error As Exception)
+        Dim detail As JSONItem = JSONItem.NewObject()
+        detail.Value("phase") = phase
+        detail.Value("type") = error.TypeName()
+        detail.Value("message") = error.Message
+        detail.Value("code") = error.ErrorCode
+        item.Value("diagnostics").Add(detail)
+    End Sub
+
+    Private Sub RecordException(item As JSONItem, phase As String, error As Exception)
+        Dim status As String = "error"
+        If error IsA TestSkipped Then status = "skipped"
+        If error IsA TestFailure Then status = "failed"
+        item.Value("status") = status
+        item.Value("message") = error.Message
+        Me.RecordDiagnostic(item, phase, error)
+    End Sub
+
+    Private Function Selected(name As String) As Boolean
+        If mFilter <> "" And Not String.Contains(name, mFilter, True) Then Return False
+        If mSelection = Nil Then Return True
+        Dim included As JSONItem = mSelection.Value("include")
+        Dim matched As Boolean = included.Count() = 0
+        For i As Integer = 0 To included.Count() - 1
+            If TestPatternMatches(name, included.ValueAt(i).AsString().Value) Then matched = True
+        Next
+        If Not matched Then Return False
+        Dim excluded As JSONItem = mSelection.Value("exclude")
+        For i As Integer = 0 To excluded.Count() - 1
+            If TestPatternMatches(name, excluded.ValueAt(i).AsString().Value) Then Return False
+        Next
+        Dim exact As JSONItem = mSelection.Value("exact")
+        If Not exact.IsNull() And Not TestHas(exact, name) Then Return False
+        Return True
+    End Function
+
+    Private Function BeginCase(name As String) As JSONItem
+        If mFinished Then Throw New InvalidArgumentException("suite already finished")
+        If mRunning Or mPending <> Nil Then Throw New InvalidArgumentException("finish the active case before starting another")
+        If name = "" Then Throw New InvalidArgumentException("case name is required")
+        For i As Integer = 0 To mCases.Count() - 1
+            If String.Compare(mCases.ValueAt(i).Value("name").AsString().Value, name, True) = 0 Then Throw New InvalidArgumentException("duplicate case name: " + name)
+        Next
+        Dim item As JSONItem = JSONItem.NewObject()
+        item.Value("name") = name
+        item.Value("status") = "passed"
+        item.Value("message") = ""
+        item.Value("diagnostics") = JSONItem.NewArray()
+        item.Value("duration") = 0.0
+        Dim selected As Boolean = Me.Selected(name)
+        item.Value("selected") = selected
+        If selected Then
+            mSelected += 1
+        Else
+            item.Value("status") = "skipped"
+            item.Value("message") = "filtered"
+            If mSelection <> Nil Then item.Value("message") = "not selected"
+        End If
+        mCases.Add(item)
+        Return item
+    End Function
+
+    Private Sub CleanupCase(item As JSONItem, cleanup As TestAction)
+        Try
+            If cleanup <> Nil Then cleanup()
+        Catch e As Exception
+            item.Value("status") = "error"
+            item.Value("message") = item.Value("message").AsString().Or("") + " cleanup: " + e.Message
+            Me.RecordDiagnostic(item, "cleanup", e)
+        End Try
+    End Sub
+
+    Private Sub EndCase(item As JSONItem, started As Integer)
+        item.Value("duration") = (System.Microseconds() - started) / 1000000.0
+        Dim status As String = item.Value("status").AsString().Value
+        If status = "failed" Or status = "error" Then mFailures += 1
+    End Sub
+
+    Public Sub Run(name As String, action As TestAction, setup As TestAction = Nil, cleanup As TestAction = Nil)
+        If action = Nil Then Throw New InvalidArgumentException("case action is required")
+        Dim item As JSONItem = Me.BeginCase(name)
+        If Not item.Value("selected").AsBoolean().Value Then Return
+        Dim started As Integer = System.Microseconds()
+        Dim phase As String = "setup"
+        mRunning = True
+        Try
+            If setup <> Nil Then setup()
+            phase = "case"
+            action()
+        Catch e As Exception
+            Me.RecordException(item, phase, e)
+        Finally
+            Me.CleanupCase(item, cleanup)
+            Me.EndCase(item, started)
+            mRunning = False
+        End Try
+    End Sub
+
+    ''' Begin one asynchronous case, then return to the caller's event loop.
+    ''' Call PollAsync from that loop/timer until HasPendingAsync becomes False.
+    Public Function RunAsync(name As String, action As AsyncTestAction, timeoutSeconds As Double, setup As TestAction = Nil, cleanup As TestAction = Nil) As AsyncTestToken
+        If Not Thread.IsMain() Then Throw New InvalidArgumentException("async cases must start on the main thread")
+        If action = Nil Then Throw New InvalidArgumentException("async action is required")
+        If Not (timeoutSeconds > 0.0 And timeoutSeconds <= 86400.0) Then Throw New InvalidArgumentException("async timeout must be finite and within (0, 86400] seconds")
+        Dim item As JSONItem = Me.BeginCase(name)
+        Dim started As Integer = System.Microseconds()
+        Dim timeoutMicros As Integer = timeoutSeconds * 1000000.0
+        Dim deadline As Integer = started + timeoutMicros
+        Dim token As New AsyncTestToken(Me, deadline, item.Value("selected").AsBoolean().Value)
+        If Not item.Value("selected").AsBoolean().Value Then Return token
+        mPending = token
+        mPendingItem = item
+        mPendingCleanup = cleanup
+        mPendingStart = started
+        Dim phase As String = "setup"
+        mRunning = True
+        Try
+            If setup <> Nil Then setup()
+            phase = "case"
+            action(token)
+        Catch e As Exception
+            Dim status As String = "error"
+            If e IsA TestSkipped Then status = "skipped"
+            If e IsA TestFailure Then status = "failed"
+            token.Reject(e, status)
+            item.Value("exception_phase") = phase
+        Finally
+            mRunning = False
+        End Try
+        Me.PollAsync()
+        Return token
+    End Function
+
+    ''' Advances one pending case without pumping any platform or console run loop.
+    ''' Returns True when no asynchronous case remains.
+    Public Function PollAsync() As Boolean
+        If Not Thread.IsMain() Then Throw New InvalidArgumentException("async polling must run on the main thread")
+        If mFinalizing Or mRunning Then Return False
+        If mPending = Nil Then Return True
+        If mPending.IsInvoking Then Return False
+        mPending.Poll()
+        If Not mPending.IsComplete Then Return False
+        mFinalizing = True
+        Try
+            mPendingItem.Value("status") = mPending.Status
+            If mPending.Error <> Nil Then
+                mPendingItem.Value("message") = mPending.Error.Message
+                Me.RecordDiagnostic(mPendingItem, mPendingItem.Value("exception_phase").AsString().Or("case"), mPending.Error)
+            End If
+            mPendingItem.Remove("exception_phase")
+            mPending.Invalidate()
+            Me.CleanupCase(mPendingItem, mPendingCleanup)
+            Me.EndCase(mPendingItem, mPendingStart)
+        Finally
+            mPending = Nil
+            mPendingItem = Nil
+            mPendingCleanup = Nil
+            mFinalizing = False
+        End Try
+        Return True
+    End Function
+
+    Public Function Report() As String
+        Dim value As JSONItem = JSONItem.NewObject()
+        value.Value("schema") = 1
+        value.Value("complete") = mFinished
+        value.Value("suite") = mName
+        value.Value("cases") = mCases
+        value.Value("late_callbacks") = mLateCallbacks
+        If mSelection <> Nil Then
+            Dim selection As JSONItem = JSONItem.NewObject()
+            selection.Value("version") = 1
+            selection.Value("applied") = True
+            selection.Value("selected") = mSelected
+            selection.Value("discovered") = mCases.Count()
+            Dim unmatched As JSONItem = JSONItem.NewArray()
+            Dim exact As JSONItem = mSelection.Value("exact")
+            For i As Integer = 0 To exact.Count() - 1
+                Dim name As String = exact.ValueAt(i).AsString().Value
+                Dim found As Boolean = False
+                For j As Integer = 0 To mCases.Count() - 1
+                    If String.Compare(mCases.ValueAt(j).Value("name").AsString().Value, name, True) = 0 Then found = True
+                Next
+                If Not found Then unmatched.Add(name)
+            Next
+            selection.Value("unmatched") = unmatched
+            value.Value("selection") = selection
+        End If
+        Return Json.Stringify(value)
+    End Function
+
+    ''' Emit and flush exactly one final record; exit 1 after failed cases.
+    Public Sub Finish()
+        If mFinished Then Throw New InvalidArgumentException("suite already finished")
+        If mRunning Or mPending <> Nil Then Throw New InvalidArgumentException("finish the active case before finishing the suite")
+        If mCases.Count() = 0 Then Throw New InvalidArgumentException("suite contains no cases")
+        mFinished = True
+        Print "BUOY_TESTKIT " + Me.Report()
+        StdOut.Flush()
+        If mFailures > 0 Then TestKitExit(1)
+    End Sub
+End Class
