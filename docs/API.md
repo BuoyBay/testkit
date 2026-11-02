@@ -6,13 +6,6 @@ The [example](../examples/testkit_demo.bui) shows a complete consumer, and
 the [async example](../examples/testkit_async_demo.bui) shows explicit queue
 scheduling without taking over a native application's event loop.
 
-Build and run the sealed-package tests:
-
-```sh
-./dist/buoy-dev task build-testkit
-./dist/buoy-dev test --filter testkit --json dist/testkit.json --junit dist/testkit.xml
-```
-
 `TestSuite(name, filter = "")` runs explicit `TestAction` delegates with
 `Run(name, action, setup: callback, cleanup: callback)`. Cases execute in call
 order. The optional filter is a case-sensitive substring of the case name;
@@ -53,8 +46,7 @@ Each case includes a `diagnostics` array. Entries contain `phase` (`setup`,
 `code`. Original and cleanup exceptions are retained separately in occurrence
 order, including skips caused by `TestSkipped`. Passed and filtered cases have
 empty arrays. These are additive fields in schema 1; existing status/message
-fields keep their behavior. Stack traces are unavailable through Buoy's public
-exception API and are not included.
+fields keep their behavior. Buoy's public exception API does not expose stack traces.
 
 Cases additionally include finite, nonnegative `duration` in seconds, measured
 with the monotonic clock from setup through cleanup, and `selected`. A filtered
@@ -98,20 +90,7 @@ increment `late_callbacks` before suite completion and become no-ops afterwards.
 
 This API does not interrupt blocked setup, callbacks or cleanup. The outer
 process watchdog remains required. Console code may explicitly drain its callback
-queue; desktop code should poll from its native timer. The executed Linux
-scheduler probe establishes callback
-queue delivery and observes no native timer delivery under console pumping.
-The desktop scheduler probe executes
-a real native timer under the Linux desktop loop and checks completion/cleanup.
-Run `./dist/buoy-dev task probe-testkit-native` to check its six targets and
-execute it on the host (Linux uses Xvfb when no display is present).
-The 13-case consumer and desktop native timer probe also pass on macOS arm64
-and Windows x64; see `dist/xojounit-macos-validation/results.md` and
-`dist/xojounit-windows-validation/results.md` for exact tested snapshots.
-On the Linux host the desktop
-probe runs under Xvfb with runtime libraries from
-`/usr/lib/buoy/runtime/x86_64-unknown-linux-gnu` and the existing JPEG8 prerequisite
-at `/tmp/buoy-chatui-jpeg8/build` in `LD_LIBRARY_PATH`.
+queue; desktop code should poll from its native timer. Console applications should explicitly drain their callback queue. Desktop applications should poll from a native timer while the application event loop is running.
 
 The process runner validates the final record and exit status together. Crashes,
 timeouts and missing/truncated records remain infrastructure failures. The
@@ -128,5 +107,3 @@ rendering or real input behavior.
 The package, test and example are compiler-checked on six targets. Runtime
 validation is performed on Linux x64, macOS arm64 and Windows x64. Intel macOS
 is build-checked only; ARM64 Linux/Windows execution is unverified.
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.

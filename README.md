@@ -1,12 +1,10 @@
 # Define test cases, assertions, cleanup and structured results
 
-Explicit Buoy test cases, catchable assertions, setup/cleanup and versioned JSON
+Explicit test cases, catchable assertions, setup/cleanup and versioned JSON
 results. Copy `testkit-0.1.0.buipkg` into `packages/`, then `Import testkit`.
 The [example](examples/testkit_demo.bui) shows a complete consumer, and
 the [async example](examples/testkit_async_demo.bui) shows explicit queue
 scheduling without taking over a native application's event loop.
-
-Build and run the sealed-package tests:
 
 ## Install
 
@@ -14,14 +12,14 @@ From a Buoy consumer project with BPM installed:
 
 ```sh
 bpm add testkit --git https://github.com/BuoyBay/testkit.git --rev refs/heads/main
-```
+```basic
 
 BPM records the resolved commit in its lockfile. Keep that lockfile with the
 consumer project for reproducible installs.
 
 ## Example
 
-```buoy
+```basic
 Import testkit
 
 Private Sub Arithmetic()
@@ -55,8 +53,6 @@ On your own machine, install Buoy and run:
 ```sh
 buoy ai init --both
 ```
-
-The generated agent files and editor settings stay local and are ignored by Git.
 
 ## Contributing
 
