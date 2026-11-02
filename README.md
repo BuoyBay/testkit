@@ -1,4 +1,4 @@
-# Test cases, assertions, cleanup, JSON results
+# Tests, assertions, JSON results
 
 Explicit test cases, catchable assertions, setup/cleanup and versioned JSON
 results. Copy `testkit-0.1.0.buipkg` into `packages/`, then `Import testkit`.
