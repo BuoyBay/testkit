@@ -2,5 +2,5 @@
   "schema": 1,
   "name": "testkit",
   "version": "0.1.0",
-  "description": "Explicit test cases, throwing assertions, cleanup and versioned results"
+  "description": "Test cases, assertions, cleanup, JSON results"
 }
